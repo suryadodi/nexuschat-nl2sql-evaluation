@@ -1,0 +1,173 @@
+# NexusChat
+
+**An end-to-end agentic Natural-Language-to-SQL engine that turns plain-English business questions into validated, executed, and human-friendly answers — without any hardcoded knowledge of the underlying schema.**
+
+
+## The 30-Second Pitch
+
+> I designed and built **NexusChat**, a production-style NL2SQL system on the AdventureWorks 2019 database. A user asks a business question in English; the system autonomously discovers the relevant tables, plans a join graph, drafts a T-SQL query, executes it against a live SQL Server, critiques its own result set with an LLM auditor, self-corrects up to 10 times if it detects a business-logic flaw, and finally returns a clean, currency-formatted answer. It's **zero-static** — no schema is hardcoded, it learns the database at setup time and stores everything as a vector knowledge base. I built the full stack myself: the Next.js 16 / React 19 frontend, the FastAPI Python agent, the agentic AI pipeline, the RAG knowledge base, and the Docker-based SQL Server deployment.
+
+---
+
+## Why This Project Matters
+
+### The Real-World Problem
+
+Every company sits on a SQL database that only analysts can query. Business users wait days for ad-hoc reports. Existing "text-to-SQL" tools are brittle — they hallucinate joins, sum over-counted columns, or ignore business semantics like "net sales vs. gross revenue". Getting one number wrong in finance reports is unacceptable.
+
+### The Solution
+
+NexusChat treats SQL generation as an **agentic problem**, not a pattern-matching problem. The LLM is wrapped in a closed **Draft → Execute → Audit → Repair** loop that catches its own mistakes by running the query and inspecting the sample results *before* presenting anything to the user. Combined with a RAG-based schema understanding layer, it produces SQL that matches the quality of a senior data analyst — **verified against 12 canonical AdventureWorks analyses from a published benchmark, all correct.**
+
+---
+
+## Live at a Glance
+
+```
+User types:    "Which region generated the highest revenue?"
+                                ↓
+   Refined →    "Total gross revenue by SalesTerritory.Group,
+                 ranked descending, include region names."
+                                ↓
+Top-5 Tables →  Sales.SalesTerritory   (cosine 0.89)
+                Sales.SalesOrderHeader (cosine 0.86)  ...
+                                ↓
+   Anchor →     Sales.SalesTerritory (weighted score 9.4)
+                                ↓
+SQL Draft →     SELECT TOP 10 st.[Group], SUM(soh.TotalDue) ...
+                                ↓
+Test Run (5) →  North America | 89228792.39
+                Europe        | 22173617.63
+                Pacific       | 11814376.10
+                                ↓
+ Critic  →      PASS — correctly uses TotalDue (gross),
+                no SalesOrderDetail over-counting.
+                                ↓
+ Answer →       "North America leads with $89.23M in revenue,
+                 followed by Europe at $22.17M and the Pacific
+                 region at $11.81M..."
+```
+
+End-to-end latency: **~12–18 seconds**. Cost: **~$0.0008 per query** (GPT-4o + embeddings).
+
+---
+
+## Architecture
+
+```
+┌────────────────┐       ┌─────────────────────┐       ┌──────────────────┐
+│  Next.js 16 UI │  ────►│  FastAPI Agent :8000│  ────►│  SQL Server 2022 │
+│  React 19      │       │  - /connect         │       │  (Docker)        │
+│  Tailwind 4    │       │  - /query           │       │  AdventureWorks  │
+│  Port :3000    │       │  - /services/*      │       │  :1433           │
+└────────────────┘       └──────────┬──────────┘       └──────────────────┘
+                                    │
+                         ┌──────────┴──────────┐
+                         ▼                     ▼
+                ┌─────────────────┐   ┌────────────────────┐
+                │  RAG Knowledge  │   │  OpenAI APIs       │
+                │  Base (offline) │   │  - GPT-4o (reason) │
+                │  1536-dim       │   │  - GPT-4o-mini     │
+                │  embeddings     │   │  - text-embedding  │
+                └─────────────────┘   │    -3-small        │
+                                      └────────────────────┘
+```
+
+**Two-phase engine:**
+- **Pre-Plan** (offline, once): extract schema → LLM narrative analysis → embed into a vector store.
+- **Post-Plan** (runtime, every query): 6-step agentic pipeline — refine → semantic search → graph expand → blueprint → draft-critic loop → NL synthesis.
+
+---
+
+## Technical Highlights (the hard parts)
+
+### 1. Zero-Static Schema Understanding
+The system has **no hardcoded knowledge** of AdventureWorks. During setup it reads `INFORMATION_SCHEMA`, pulls 2-row samples and all foreign keys, asks GPT-4o to write a business-context narrative for every table, and embeds each narrative into a 1536-dimension vector. At runtime, cosine similarity against this vector store finds the relevant tables. **Point it at any SQL Server database and it learns from scratch.**
+
+### 2. Deterministic Graph Pruning (Not Pure LLM)
+LLMs are bad at planning multi-table joins. So I offloaded that to a **deterministic graph algorithm**:
+- **Anchor selection** uses a weighted scoring model (semantic match × 1.5 + connectivity × 0.5 + structural bonus + vector score × 3.0) to pick the `FROM` table.
+- **BFS graph expansion** up to 3 hops classifies every candidate as `Entity` / `MetricSource` / `Dimension` / `Noise` using in/out-degree and column count relative to schema-wide averages — *adaptive, not static thresholds*.
+- A second pass collects every join edge where both endpoints are in the connected set, preventing the classic "missing bridge" bug.
+
+The LLM only writes SQL *after* the blueprint is deterministic. This cut hallucinated joins to zero in my benchmark runs.
+
+### 3. Self-Correcting Agentic Loop
+The flagship feature. GPT-4o writes SQL → the system runs `SELECT TOP 5 <query>` inside the SQL container → a second GPT-4o instance (the **Critic**, running a "Senior SQL Auditor" persona) reads *both the query and the 5-row sample* and returns `PASS` or `FAIL` with a specific fix instruction. On fail, the feedback is threaded into the next generation attempt. Max 10 iterations. **Most queries pass on iteration 1; complex financial queries typically take 2–3.**
+
+### 4. The Over-Counting Trap (domain depth)
+The single most common SQL mistake in transactional databases: joining `SalesOrderHeader` with `SalesOrderDetail` and then `SUM(TotalDue)` — which inflates revenue 3–10× because the header total gets repeated per line item. I encoded this as a hard rule in both the Generator's system prompt *and* the Critic's audit criteria. This is the kind of domain-aware safety that separates toy NL2SQL demos from something that could actually run in production finance.
+
+### 5. Full Transparency to the End User
+Every `print()` statement inside the 6-step pipeline is captured via `contextlib.redirect_stdout` into a `StringIO` buffer and returned in the API response as a `logs` array. The UI renders this as an **Engine Execution Blueprint** inspector — users can expand any AI answer and see refinement, table matches with cosine scores, active joins, every iteration, Critic verdicts, final SQL, and cost/time metrics. This turns the AI from a black box into an auditable tool.
+
+### 6. Production-Grade DevOps Fixes
+**Real bug, real fix:** The original SQL container had no persistent volume — after every Docker update or Mac restart, AdventureWorks was silently wiped. I diagnosed it, added a named volume (`sqlserver_data`) in `docker-compose.yml`, and documented the migration. This is the unglamorous infra work that most portfolio projects skip.
+
+### 7. Dynamic Connection Management
+Credentials are never hardcoded. The user enters them through the Settings UI, the agent runs `docker exec sqlcmd` to verify them *live*, caches them in memory and to disk (`connection_cache.json`) so agent restarts survive, and dynamically discovers the SQL container name (exact → image-match → name-contains fallback).
+
+---
+
+## Benchmark: Validated Against a Published Reference
+
+I benchmarked NexusChat against the canonical 12-question AdventureWorks analysis from [*Exploring AdventureWorks2019 Database using SQL* (Iyanu Olatunji, Medium)](https://medium.com/@iyanuolatunji21/exploring-adventureworks2019-database-using-sql-fdffac5d8b25).
+
+The article contains **hand-written SQL by a human data analyst** for 12 business questions covering the entire sales schema. For each question, I gave NexusChat the plain-English version of the question — nothing else — and compared its autonomously-generated SQL and numerical results to the reference.
+
+| Question Theme                       | Joins Required | NexusChat Result   |
+| :----------------------------------- | :------------- | :----------------- |
+| Sales by product category            | 5 tables       | Match              |
+| Seasonal sales trends                | 2 tables       | Match              |
+| Top sales representatives            | 1 table        | Match              |
+| Cross-sell / up-sell opportunities   | Self-join + CTE| Match              |
+| Products with highest units sold     | 2 tables       | Match              |
+| Highest-revenue region               | 2 tables       | Match              |
+| Territory purchasing behaviour       | 3 tables       | Match              |
+| Product popularity per region        | 3 tables + RANK| Match              |
+| Top spending customers               | 4 tables       | Match              |
+| Online vs in-person channels         | 1 table + CASE | Match              |
+| Most profitable products             | 2 tables       | Match              |
+| Overall yearly sales performance     | 1 table        | Match              |
+
+**All 12 questions produced the same numerical results as the reference analyst's hand-written queries.** Full execution traces — refined queries, cosine scores, iteration histories, Critic verdicts, timings — are captured in a [public validation log spreadsheet](https://docs.google.com/spreadsheets/d/1baeedstrM9wZqRiRsaW7h1oVU3f0RoY24nAsww6WnEs/edit?gid=527362238#gid=527362238).
+
+---
+
+## Skills Demonstrated (mapped to what recruiters search for)
+
+| Category                  | Specifics                                                                                  |
+| :------------------------ | :----------------------------------------------------------------------------------------- |
+| **Generative AI / LLMs**  | GPT-4o orchestration · multi-persona prompt engineering · agentic self-correction loops · cost tracking |
+| **RAG / Vector Search**   | OpenAI embeddings (`text-embedding-3-small`) · cosine similarity · knowledge-base design · metadata vs embedding separation |
+| **Backend / Python**      | FastAPI · Pydantic · async endpoints · subprocess management · stdout redirection · `pyodbc` |
+| **Frontend**              | Next.js 16 (App Router) · React 19 · TypeScript · Tailwind 4 · Framer Motion · `next-themes` |
+| **SQL / Data Modelling**  | T-SQL · AdventureWorks schema mastery · FK graph traversal · over-counting prevention · ranking/window functions |
+| **DevOps / Infrastructure** | Docker · Docker Compose · named volumes for data persistence · container health checks · cross-container networking |
+| **System Design**         | Two-phase architecture (offline vs runtime) · deterministic planning + probabilistic LLM synthesis · zero-static knowledge extraction |
+| **Software Engineering**  | Idempotent pipelines · graceful error handling · connection lifecycle management · observable logging |
+| **Product / UX**          | Execution transparency panel · live connection verification · dark mode · history view |
+
+---
+
+## What I Owned End-to-End
+
+I was the sole builder. Every file in the repo — UI components, AI pipeline, FastAPI endpoints, Dockerfile, Docker Compose manifests, documentation — was designed, written, and debugged by me.
+
+- **UI:** 8 React components, 3 pages, dark mode, execution-inspector modal, real-time log rendering
+- **Agent:** 7 FastAPI endpoints, dynamic Docker container discovery, connection caching, stdout capture
+- **AI Engine:** 6-step orchestrator, anchor selector, graph pruner, SQL generator, SQL executor, Critic, NL synthesizer
+- **RAG Pipeline:** 3-step idempotent schema extraction → LLM analysis → embedding
+- **DevOps:** Two-service Compose stack, persistent volume fix, first-time setup automation
+- **Documentation:** 5 sub-READMEs plus a consolidated root README plus a runbook — every module has its own deep-dive
+
+## Links
+
+- **Validation Log:** [NexusChat Execution Spreadsheet](https://docs.google.com/spreadsheets/d/1baeedstrM9wZqRiRsaW7h1oVU3f0RoY24nAsww6WnEs/edit?gid=527362238#gid=527362238)
+- **Benchmark Reference:** [AdventureWorks Exploration — Iyanu Olatunji, Medium](https://medium.com/@iyanuolatunji21/exploring-adventureworks2019-database-using-sql-fdffac5d8b25)
+- **Root README:** [`README.md`](README.md)
+- **Setup Runbook:** [`HOW_TO_RUN.md`](HOW_TO_RUN.md)
+
+*NexusChat was built to prove that a single engineer, with the right architecture, can ship an agentic AI product that would have taken a five-person team two years to build in 2022. If that's the kind of leverage your team needs, let's talk.
+
+
